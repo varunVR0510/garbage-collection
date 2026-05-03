@@ -1,26 +1,37 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
+from datetime import datetime
+from typing import Optional
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 import math
 from routes.predictions import get_zones_predictions
 from routes.fleet import get_real_fleet
+from ml.route_geometry import all_district_centroids
+import db
+
+
+def _parse_date(date_str: Optional[str]) -> Optional[datetime]:
+    if date_str:
+        try:
+            return datetime.fromisoformat(date_str)
+        except Exception:
+            pass
+    return None
 
 router = APIRouter()
 
-# Pseudo-coordinates for Austin 10 Districts & Depot
-COORDS = {
-    'Depot': (30.2672, -97.7431),
-    'District 1': (30.2800, -97.7300),
-    'District 2': (30.2200, -97.6000),
-    'District 3': (30.2500, -97.5500),
-    'District 4': (30.1000, -97.7500),
-    'District 5': (30.1100, -97.7600),
-    'District 6': (30.3400, -97.7000),
-    'District 7': (30.2700, -97.7500),
-    'District 8': (30.3500, -97.8500),
-    'District 9': (30.3000, -97.7700),
-    'District 10': (30.2600, -97.7700)
-}
+FUEL_LITRES_PER_KM = 0.35  # ~35L/100km for a garbage truck
+COST_PER_LITRE = 95.0      # demo cost — easy to swap
+
+DEPOT_COORD = (30.2672, -97.7431)  # Austin Resource Recovery, downtown
+
+def _coords():
+    """Live district centroids from austin_routes_2015.xlsx (computed via KMeans on
+    polygon centroids). Falls back to Depot if a district is missing."""
+    centroids = all_district_centroids()
+    coords = {'Depot': DEPOT_COORD}
+    coords.update(centroids)
+    return coords
 
 def haversine(coord1, coord2):
     R = 6371  # km
@@ -32,16 +43,19 @@ def haversine(coord1, coord2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
-def create_data_model():
+def create_data_model(date_str: Optional[str] = None):
     """Stores the data for the routing problem."""
     data = {}
-    
-    # Get active zones (Critical or Medium) from prediction API
-    all_zones = get_zones_predictions()
-    zones = [z for z in all_zones if z['status'] in ['critical', 'medium']]
-    # Limit to top 8 to ensure VRP solves quickly
-    zones.sort(key=lambda x: x['level'], reverse=True)
-    zones = zones[:8]
+    coords = _coords()
+
+    all_zones = get_zones_predictions(date=date_str)
+    priority = [z for z in all_zones if z['status'] in ['high', 'medium']]
+    if priority:
+        priority.sort(key=lambda x: x['level'], reverse=True)
+        zones = priority[:8]
+    else:
+        all_zones.sort(key=lambda x: x['level'], reverse=True)
+        zones = all_zones[:8]
     
     # Nodes: 0 is Depot, 1..N are zones
     locations = ['Depot'] + [z['name'] for z in zones]
@@ -55,7 +69,7 @@ def create_data_model():
     for i in range(num_locations):
         row = []
         for j in range(num_locations):
-            dist_km = haversine(COORDS.get(locations[i], COORDS['Depot']), COORDS.get(locations[j], COORDS['Depot']))
+            dist_km = haversine(coords.get(locations[i], coords['Depot']), coords.get(locations[j], coords['Depot']))
             row.append(int(dist_km * 1000))
         distance_matrix.append(row)
     data['distance_matrix'] = distance_matrix
@@ -68,7 +82,8 @@ def create_data_model():
     data['demands'] = demands
     
     # Vehicles from Fleet API
-    fleet = get_real_fleet()
+    when = _parse_date(date_str)
+    fleet = get_real_fleet(when=when)
     active_trucks = [t for t in fleet if t['status'] != 'idle']
     if not active_trucks:
         # Fallback to 2 generic trucks if none active
@@ -82,8 +97,8 @@ def create_data_model():
     
     return data
 
-def solve_vrp():
-    data = create_data_model()
+def solve_vrp(date_str: Optional[str] = None):
+    data = create_data_model(date_str)
     
     if data['num_vehicles'] == 0 or len(data['locations']) <= 1:
         return None
@@ -122,8 +137,8 @@ def solve_vrp():
     return None
 
 @router.get("/optimized")
-def get_optimized_route():
-    result = solve_vrp()
+def get_optimized_route(date: Optional[str] = Query(None)):
+    result = solve_vrp(date)
     if not result:
         return []
         
@@ -175,12 +190,41 @@ def get_optimized_route():
     
     return timeline
 
-@router.get("/summary")
-def get_route_summary():
-    result = solve_vrp()
+def _naive_distance_km(data) -> float:
+    """Sequential depot -> all stops -> depot, with no optimization."""
+    matrix = data['distance_matrix']
+    if len(matrix) <= 1:
+        return 0.0
+    total_m = 0
+    prev = 0  # depot
+    for i in range(1, len(matrix)):
+        total_m += matrix[prev][i]
+        prev = i
+    total_m += matrix[prev][0]  # back to depot
+    return total_m / 1000.0
+
+
+def compute_route_summary(date_str: Optional[str] = None):
+    """Compute optimized + naive baseline. Returns numeric dict (or None)."""
+    all_zones_now = get_zones_predictions(date=date_str)
+    total_zones = len(all_zones_now)
+    must_collect = sum(1 for z in all_zones_now if z['status'] in ['high', 'medium'])
+    trips_avoided = max(total_zones - must_collect, 0)
+
+    result = solve_vrp(date_str)
     if not result:
-        return {"distance": "0 km", "fuel": "0.0 L", "time": "0h 0m"}
-        
+        return {
+            "total_km": 0.0, "naive_km": 0.0,
+            "fuel_l": 0.0, "naive_fuel_l": 0.0,
+            "hours": 0.0,
+            "saved_km": 0.0, "saved_fuel_l": 0.0, "saved_pct": 0.0,
+            "stops": 0,
+            "total_zones": total_zones,
+            "must_collect": must_collect,
+            "trips_avoided": trips_avoided,
+            "_no_solution": True,
+        }
+
     data, manager, routing, solution = result
     total_distance_m = 0
     for vehicle_id in range(data['num_vehicles']):
@@ -191,16 +235,54 @@ def get_route_summary():
             index = solution.Value(routing.NextVar(index))
             route_distance += routing.GetArcCostForVehicle(previous_index, index, vehicle_id)
         total_distance_m += route_distance
-        
+
     total_km = total_distance_m / 1000.0
-    fuel_l = total_km * 0.35 # Approx 35L / 100km for garbage truck
-    hours = total_km / 25.0 + (len(data['locations']) - 1) * 0.5 # 25km/h avg speed + 30 min per stop
-    
-    h = int(hours)
-    m = int((hours - h) * 60)
-    
+    naive_km = _naive_distance_km(data)
+    fuel_l = total_km * FUEL_LITRES_PER_KM
+    naive_fuel_l = naive_km * FUEL_LITRES_PER_KM
+    stops = max(len(data['locations']) - 1, 0)
+    hours = (total_km / 25.0) + stops * 0.5  # 25 km/h + 30 min/stop
+
+    saved_km = max(naive_km - total_km, 0.0)
+    saved_fuel_l = max(naive_fuel_l - fuel_l, 0.0)
+    saved_pct = (saved_km / naive_km * 100.0) if naive_km > 0 else 0.0
+
     return {
-        "distance": f"{total_km:.1f} km",
-        "fuel": f"{fuel_l:.1f} L",
-        "time": f"{h}h {m}m"
+        "total_km": total_km,
+        "naive_km": naive_km,
+        "fuel_l": fuel_l,
+        "naive_fuel_l": naive_fuel_l,
+        "hours": hours,
+        "saved_km": saved_km,
+        "saved_fuel_l": saved_fuel_l,
+        "saved_pct": saved_pct,
+        "stops": stops,
+        "total_zones": total_zones,
+        "must_collect": must_collect,
+        "trips_avoided": trips_avoided,
+    }
+
+
+@router.get("/summary")
+def get_route_summary(date: Optional[str] = Query(None)):
+    s = compute_route_summary(date)
+    h = int(s["hours"])
+    m = int((s["hours"] - h) * 60)
+
+    if not s.get("_no_solution"):
+        try:
+            db.log_route_run(s["total_km"], s["naive_km"], s["fuel_l"], s["naive_fuel_l"])
+        except Exception:
+            pass
+
+    return {
+        "distance": f"{s['total_km']:.1f} km",
+        "fuel": f"{s['fuel_l']:.1f} L",
+        "time": f"{h}h {m}m",
+        "savedKm": round(s["saved_km"], 1),
+        "savedFuelL": round(s["saved_fuel_l"], 1),
+        "savedPct": round(s["saved_pct"], 1),
+        "tripsAvoided": s["trips_avoided"],
+        "totalZones": s["total_zones"],
+        "mustCollect": s["must_collect"],
     }

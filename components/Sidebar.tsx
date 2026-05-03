@@ -2,6 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import { useEffect, useState } from 'react';
 import {
   LayoutDashboard,
   MapPin,
@@ -20,6 +21,14 @@ const navItems = [
 
 export default function Sidebar() {
   const pathname = usePathname();
+  const [modelInfo, setModelInfo] = useState<{ maeTons: number | null; label: string } | null>(null);
+
+  useEffect(() => {
+    fetch('http://localhost:8000/api/model/status')
+      .then(r => r.json())
+      .then(d => setModelInfo({ maeTons: d.mae_tons, label: d.accuracy_label }))
+      .catch(() => {});
+  }, [pathname]);
 
   return (
     <aside className="fixed top-0 left-0 h-screen w-60 bg-blue-900 text-white flex flex-col z-50 shadow-xl">
@@ -59,7 +68,13 @@ export default function Sidebar() {
       {/* Footer */}
       <div className="px-5 py-4 border-t border-blue-800">
         <p className="text-blue-400 text-xs">Austin Resource Recovery</p>
-        <p className="text-blue-500 text-xs">AI Accuracy: 99.0%</p>
+        <p className="text-blue-500 text-xs">
+          {modelInfo === null
+            ? 'Model: loading…'
+            : modelInfo.maeTons === null
+              ? 'Model: untrained'
+              : `Avg error: ±${modelInfo.maeTons} T · ${modelInfo.label}`}
+        </p>
       </div>
     </aside>
   );

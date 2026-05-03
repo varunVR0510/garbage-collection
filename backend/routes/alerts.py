@@ -1,21 +1,22 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
+from typing import Optional
 from routes.predictions import get_zones_predictions
 
 router = APIRouter()
 
 @router.get("/alerts")
-def get_alerts():
-    zones = get_zones_predictions()
+def get_alerts(date: Optional[str] = Query(None)):
+    zones = get_zones_predictions(date=date)
     
     alerts = []
     alert_id = 1
     
     for z in zones:
-        if z['status'] == 'critical':
+        if z['status'] == 'high':
             alerts.append({
                 "id": alert_id,
                 "icon": "🚨",
-                "severity": "critical",
+                "severity": "high",
                 "title": f"Overflow Risk: {z['name']}",
                 "message": f"Fill level is at {z['level']}%. Immediate collection recommended based on XGBoost prediction.",
                 "time": "Just now",

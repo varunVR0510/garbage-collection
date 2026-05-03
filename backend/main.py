@@ -7,6 +7,10 @@ from routes.fleet import router as fleet_router
 from routes.routing import router as routing_router
 from routes.alerts import router as alerts_router
 from routes.analytics import router as analytics_router
+from routes.feedback import router as feedback_router
+from routes.model import router as model_router
+from routes.schedule import router as schedule_router
+from routes.dispatch import router as dispatch_router
 
 app = FastAPI(title="Austin SmartWaste Backend API")
 
@@ -19,12 +23,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(dashboard_router, prefix="/api")
+app.include_router(dashboard_router, prefix="/api/dashboard")
 app.include_router(predictions_router, prefix="/api")
 app.include_router(fleet_router, prefix="/api/fleet")
 app.include_router(routing_router, prefix="/api/routes")
 app.include_router(alerts_router, prefix="/api")
 app.include_router(analytics_router, prefix="/api")
+app.include_router(feedback_router, prefix="/api/feedback")
+app.include_router(model_router, prefix="/api/model")
+app.include_router(schedule_router, prefix="/api/schedule")
+app.include_router(dispatch_router, prefix="/api/dispatch")
 
 @app.get("/")
 def read_root():

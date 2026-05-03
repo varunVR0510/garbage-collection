@@ -1,0 +1,75 @@
+{
+  "_note": "Plausible demographic profile per Austin service district. Used as ML features and for waste-density KPIs.",
+  "districts": {
+    "District 1": {
+      "population": 84210,
+      "households": 32100,
+      "area_sqkm": 18.4,
+      "commercial_index": 0.62,
+      "income_level": "mid"
+    },
+    "District 2": {
+      "population": 121540,
+      "households": 44820,
+      "area_sqkm": 27.9,
+      "commercial_index": 0.71,
+      "income_level": "mid"
+    },
+    "District 3": {
+      "population": 68900,
+      "households": 26450,
+      "area_sqkm": 14.6,
+      "commercial_index": 0.84,
+      "income_level": "high"
+    },
+    "District 4": {
+      "population": 95230,
+      "households": 35640,
+      "area_sqkm": 21.2,
+      "commercial_index": 0.55,
+      "income_level": "mid"
+    },
+    "District 5": {
+      "population": 47880,
+      "households": 18300,
+      "area_sqkm": 12.0,
+      "commercial_index": 0.41,
+      "income_level": "low"
+    },
+    "District 6": {
+      "population": 110450,
+      "households": 41200,
+      "area_sqkm": 25.5,
+      "commercial_index": 0.68,
+      "income_level": "mid"
+    },
+    "District 7": {
+      "population": 55300,
+      "households": 21100,
+      "area_sqkm": 11.7,
+      "commercial_index": 0.92,
+      "income_level": "high"
+    },
+    "District 8": {
+      "population": 78640,
+      "households": 30090,
+      "area_sqkm": 19.8,
+      "commercial_index": 0.49,
+      "income_level": "low"
+    },
+    "District 9": {
+      "population": 134210,
+      "households": 49800,
+      "area_sqkm": 31.4,
+      "commercial_index": 0.76,
+      "income_level": "high"
+    },
+    "District 10": {
+      "population": 89320,
+      "households": 33780,
+      "area_sqkm": 22.6,
+      "commercial_index": 0.58,
+      "income_level": "mid"
+    }
+  }
+}

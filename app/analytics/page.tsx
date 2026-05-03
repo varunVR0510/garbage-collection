@@ -11,11 +11,12 @@ import { toast } from 'react-hot-toast';
 export default function AnalyticsPage() {
   const [retraining, setRetraining] = useState(false);
   const [retrained, setRetrained] = useState(false);
+  const [lastMae, setLastMae] = useState<string | null>(null);
   const [analyticsMetrics, setAnalyticsMetrics] = useState<any[]>([]);
   const [fuelChartData, setFuelChartData] = useState<any[]>([]);
   const [collectionsData, setCollectionsData] = useState<any[]>([]);
 
-  useEffect(() => {
+  const loadAll = () => {
     fetch('http://localhost:8000/api/metrics')
       .then(res => res.json())
       .then(data => setAnalyticsMetrics(data))
@@ -30,22 +31,34 @@ export default function AnalyticsPage() {
       .then(res => res.json())
       .then(data => setCollectionsData(data))
       .catch(err => console.error("Error fetching collections data:", err));
-  }, []);
+  };
 
-  const handleRetrain = () => {
+  useEffect(() => { loadAll(); }, []);
+
+  const handleRetrain = async () => {
     setRetraining(true);
     setRetrained(false);
-    toast.promise(
-      new Promise(resolve => setTimeout(resolve, 2500)),
-      {
-        loading: 'Uploading latest Austin datasets to model...',
-        success: 'Retraining complete: Accuracy updated.',
-        error: 'Retraining failed',
-      }
-    ).then(() => {
-      setRetraining(false);
+    try {
+      const res = await toast.promise(
+        fetch('http://localhost:8000/api/model/retrain', { method: 'POST' })
+          .then(async r => {
+            if (!r.ok) throw new Error((await r.json()).detail || 'Retrain failed');
+            return r.json();
+          }),
+        {
+          loading: 'Retraining XGBoost on real Austin dataset…',
+          success: (d: any) => `Retraining complete · MAE = ±${d.mae_tons} T (${d.accuracy_label})`,
+          error: (e: any) => e.message || 'Retraining failed',
+        }
+      );
+      setLastMae(`±${res.mae_tons} T (${res.accuracy_label})`);
       setRetrained(true);
-    });
+      loadAll();
+    } catch (e) {
+      // toast already shown
+    } finally {
+      setRetraining(false);
+    }
   };
 
   return (
@@ -89,7 +102,12 @@ export default function AnalyticsPage() {
             </ResponsiveContainer>
             <div className="mt-3 flex items-center gap-2 text-xs text-green-700 bg-green-50 rounded-lg px-3 py-2">
               <TrendingUp size={13} />
-              <span>AI routing uses <strong>~22% less fuel</strong> on average vs. traditional fixed routes.</span>
+              <span>AI routing uses <strong>~{(() => {
+                if (!fuelChartData.length) return '0';
+                const tot = fuelChartData.reduce((s, w) => s + (w.traditional || 0), 0);
+                const ai = fuelChartData.reduce((s, w) => s + (w.aiOptimized || 0), 0);
+                return tot > 0 ? Math.round((1 - ai / tot) * 100) : 0;
+              })()}% less fuel</strong> on average vs. traditional fixed routes.</span>
             </div>
           </div>
 
@@ -138,7 +156,7 @@ export default function AnalyticsPage() {
                 <h2 className="text-sm font-bold text-gray-800">Feedback Loop &amp; Model Retraining</h2>
                 <p className="text-xs text-gray-500 mt-0.5">
                   Feed this week&apos;s real collection data back into the AI model to improve predictions.
-                  {retrained && <span className="ml-2 text-green-600 font-semibold">✓ Retraining complete — accuracy updated to 94.8%</span>}
+                  {retrained && lastMae && <span className="ml-2 text-green-600 font-semibold">✓ Retraining complete — Avg error = {lastMae}</span>}
                 </p>
               </div>
             </div>

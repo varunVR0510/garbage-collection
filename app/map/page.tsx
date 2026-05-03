@@ -3,6 +3,8 @@
 import { useEffect, useState } from 'react';
 import dynamic from 'next/dynamic';
 import Header from '@/components/Header';
+import { toast } from 'react-hot-toast';
+import { useSelectedDate } from '@/lib/useSelectedDate';
 
 import type { ComponentType } from 'react';
 
@@ -29,11 +31,11 @@ const AustinMapLeaflet = dynamic(
 });
 
 const statusColors: Record<string, { badge: string; text: string; border: string; dot: string }> = {
-  critical: { badge: 'bg-red-100 text-red-700', text: 'text-red-600', border: 'border-red-200 hover:border-red-400', dot: 'bg-red-500' },
+  high: { badge: 'bg-red-100 text-red-700', text: 'text-red-600', border: 'border-red-200 hover:border-red-400', dot: 'bg-red-500' },
   medium:   { badge: 'bg-yellow-100 text-yellow-700', text: 'text-yellow-600', border: 'border-yellow-200 hover:border-yellow-400', dot: 'bg-yellow-400' },
   low:      { badge: 'bg-green-100 text-green-700', text: 'text-green-600', border: 'border-green-200 hover:border-green-400', dot: 'bg-green-500' },
 };
-const levelLabel: Record<string, string> = { critical: 'High', medium: 'Medium', low: 'Low' };
+const levelLabel: Record<string, string> = { high: 'High', medium: 'Medium', low: 'Low' };
 
 import { useRouter } from 'next/navigation';
 
@@ -41,13 +43,14 @@ export default function MapPage() {
   const [selectedZone, setSelectedZone] = useState<string | null>(null);
   const [zones, setZones] = useState<any[]>([]);
   const router = useRouter();
+  const [selectedDate] = useSelectedDate();
 
   useEffect(() => {
-    fetch('http://localhost:8000/api/zones')
+    fetch(`http://localhost:8000/api/zones?date=${selectedDate}`)
       .then(res => res.json())
       .then(data => setZones(data))
       .catch(err => console.error("Error fetching zones:", err));
-  }, []);
+  }, [selectedDate]);
 
   const sorted = [...zones].sort((a, b) => b.level - a.level);
 
@@ -75,10 +78,18 @@ export default function MapPage() {
                 const c = statusColors[zone.status];
                 const isSelected = selectedZone === zone.id;
                 return (
-                  <button
+                  <div
                     key={zone.id}
+                    role="button"
+                    tabIndex={0}
                     onClick={() => setSelectedZone(zone.id === selectedZone ? null : zone.id)}
-                    className={`w-full text-left rounded-xl border p-3.5 transition-all hover:shadow-md ${c.border} ${
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        setSelectedZone(zone.id === selectedZone ? null : zone.id);
+                      }
+                    }}
+                    className={`w-full text-left rounded-xl border p-3.5 transition-all hover:shadow-md cursor-pointer ${c.border} ${
                       isSelected ? 'shadow-md ring-2 ring-blue-300' : ''
                     } bg-white`}
                   >
@@ -104,19 +115,52 @@ export default function MapPage() {
                         </div>
                       </div>
                     </div>
-                    <p className="text-[10px] text-gray-500 mb-2.5 bg-gray-50 rounded px-2 py-1 text-left">
+                    <p className="text-[10px] text-gray-500 mb-1.5 bg-gray-50 rounded px-2 py-1 text-left">
                       🤖 AI Insight: <span className="font-medium text-gray-700">{zone.reason}</span>
                     </p>
+                    {zone.densityTonsPerSqkm !== undefined && (
+                      <div className="grid grid-cols-3 gap-1 mb-2.5 text-[9px]">
+                        <div className="bg-blue-50 rounded px-1.5 py-1 text-center">
+                          <p className="text-gray-500">Density</p>
+                          <p className="font-bold text-blue-700">{zone.densityTonsPerSqkm} T/km²</p>
+                        </div>
+                        <div className="bg-purple-50 rounded px-1.5 py-1 text-center">
+                          <p className="text-gray-500">Pop.</p>
+                          <p className="font-bold text-purple-700">{((zone.population ?? 0) / 1000).toFixed(0)}K</p>
+                        </div>
+                        <div className="bg-green-50 rounded px-1.5 py-1 text-center">
+                          <p className="text-gray-500">Per cap.</p>
+                          <p className="font-bold text-green-700">{zone.perCapitaKg} kg</p>
+                        </div>
+                      </div>
+                    )}
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        router.push(`/routes?assignZone=${zone.id}`);
+                        toast.promise(
+                          fetch('http://localhost:8000/api/dispatch/assign', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ zone_id: zone.id }),
+                          }).then(async r => {
+                            if (!r.ok) throw new Error((await r.json()).detail || 'Dispatch failed');
+                            return r.json();
+                          }),
+                          {
+                            loading: 'Dispatching truck…',
+                            success: (d: any) => {
+                              setTimeout(() => router.push(`/routes?dispatchId=${d.dispatch_id}`), 800);
+                              return `Truck ${d.truck_id} dispatched to ${d.district} · ETA ${d.eta_minutes} min (${d.distance_km} km)`;
+                            },
+                            error: (e: any) => e.message || 'Dispatch failed',
+                          }
+                        );
                       }}
                       className="w-full text-xs font-semibold bg-blue-700 hover:bg-blue-800 text-white rounded-lg py-1.5 transition-colors shadow-sm"
                     >
                       Assign GCC Vehicle
                     </button>
-                  </button>
+                  </div>
                 );
               })}
             </div>

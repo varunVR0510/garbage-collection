@@ -39,3 +39,15 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# runtime sqlite db
+*.db
+*.db-journal
+
+# generated artifacts (re-derived from austin_routes_2015.xlsx at backend startup)
+backend/data/austin_route_polygons.geojson
