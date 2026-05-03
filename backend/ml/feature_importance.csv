@@ -1,0 +1,9 @@
+feature,importance
+rolling_7_load_weight,0.6029388
+comm_index,0.106147945
+is_festival,0.10465527
+zone_id,0.06626051
+day_of_week,0.052098397
+pop_density,0.040231586
+is_weekend,0.025963003
+month,0.0017045382

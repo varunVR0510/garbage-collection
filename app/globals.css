@@ -1,0 +1,58 @@
+@import "tailwindcss";
+
+:root {
+  --sidebar-width: 240px;
+  --header-height: 64px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background-color: #f8fafc;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  min-height: 100vh;
+}
+
+/* Smooth transitions */
+* {
+  transition-property: background-color, border-color, color, fill, stroke, opacity, box-shadow, transform;
+  transition-duration: 150ms;
+  transition-timing-function: ease-in-out;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track { background: #f1f5f9; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+/* Map pulse animation */
+@keyframes pulse-ring {
+  0% { transform: scale(1); opacity: 0.8; }
+  100% { transform: scale(2.5); opacity: 0; }
+}
+.zone-pulse::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  animation: pulse-ring 2s ease-out infinite;
+}
+.zone-pulse-red::after { background: rgba(239, 68, 68, 0.4); }
+.zone-pulse-yellow::after { background: rgba(234, 179, 8, 0.4); }
+.zone-pulse-green::after { background: rgba(34, 197, 94, 0.4); }
+
+/* Timeline line */
+.timeline-line {
+  position: absolute;
+  left: 19px;
+  top: 40px;
+  bottom: 0;
+  width: 2px;
+  background: linear-gradient(to bottom, #3b82f6, #e2e8f0);
+}
