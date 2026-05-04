@@ -42,13 +42,11 @@ def _model_mae_trend() -> str:
 def get_kpi_metrics(date: Optional[str] = Query(None)):
     selected = _parse_date(date)
     zones = get_zones_predictions(date=selected.date().isoformat())
-    
-    total_waste_tons = sum(
-        # back out the max cap * level to get tons
-        (z['level'] / 100) * 150 # approximation for dashboard
-        for z in zones
-    )
-    
+
+    # Use the same blended forecast as the chart so the KPI matches the chart's data point.
+    total_waste_tons = predict_total_for_date(selected.date())
+    is_weekend = selected.weekday() in (5, 6)
+
     high_zones = sum(1 for z in zones if z['status'] == 'high')
     
     routes_df = routes_dataframe()
@@ -61,15 +59,15 @@ def get_kpi_metrics(date: Optional[str] = Query(None)):
         densities = [z.get("densityTonsPerSqkm", 0.0) for z in zones]
         avg_density = sum(densities) / len(densities) if densities else 0.0
 
-    summary = compute_route_summary()
+    summary = compute_route_summary(date_str=selected.date().isoformat())
     trips_avoided = summary.get("trips_avoided", 0) if summary else 0
     total_zones = summary.get("total_zones", len(zones)) if summary else len(zones)
 
     return [
         {
             "title": "Total Predicted Waste (Today)",
-            "value": f"{total_waste_tons:,.0f} Tons",
-            "trend": "+2.4% vs last week",
+            "value": f"{total_waste_tons:,.0f} Tons" if not is_weekend else "0 Tons",
+            "trend": "Weekend — no scheduled collection" if is_weekend else "Forecast across 10 districts",
             "trendUp": True,
             "icon": "trash"
         },
@@ -140,42 +138,35 @@ def _district_for_route(route_number) -> str:
     return DISTRICTS[val % 10]
 
 
-@router.get("/chart")
-def get_chart_data(date: Optional[str] = Query(None)):
-    """7-day forecast centered on the anchor date: -2 days .. +4 days.
-    - 'predicted' = XGBoost prediction summed across 10 districts (zeroed on weekends).
-    - 'actual' = historical mean total for that weekday from CSV (lets users compare prediction vs typical reality).
-    """
-    if not predictor.model or not predictor.feature_order:
-        return []
-
-    anchor = _parse_date(date).date()
-    today_date = datetime.now().date()
-
-    # Compute historical mean daily total per weekday + avg records-per-day for scaling.
-    weekday_actual_lbs: dict[int, float] = {}
-    avg_records_per_day = 0.0
+def _historical_weekday_means_lbs() -> tuple[dict[int, float], float]:
+    """Return (weekday_dow -> mean daily lbs from last 365d, avg_records_per_day)."""
     csv_path = _resolve_csv()
-    if csv_path:
-        df = pd.read_csv(csv_path, usecols=['Report Date', 'Load Weight'])
-        df['Report Date'] = pd.to_datetime(df['Report Date'], errors='coerce')
-        df['Load Weight'] = pd.to_numeric(df['Load Weight'], errors='coerce')
-        df = df.dropna()
-        if not df.empty:
-            cutoff = df['Report Date'].max() - pd.Timedelta(days=365)
-            df_recent = df[df['Report Date'] >= cutoff].copy()
-            df_recent['date_only'] = df_recent['Report Date'].dt.date
-            df_recent['dow'] = df_recent['Report Date'].dt.dayofweek
-            daily = df_recent.groupby(['date_only', 'dow'])['Load Weight'].sum().reset_index()
-            for dow, grp in daily.groupby('dow'):
-                weekday_actual_lbs[int(dow)] = float(grp['Load Weight'].mean())
-            counts = df_recent.groupby('date_only').size()
-            avg_records_per_day = float(counts.mean()) if not counts.empty else 0.0
+    if not csv_path:
+        return {}, 0.0
+    df = pd.read_csv(csv_path, usecols=['Report Date', 'Load Weight'])
+    df['Report Date'] = pd.to_datetime(df['Report Date'], errors='coerce')
+    df['Load Weight'] = pd.to_numeric(df['Load Weight'], errors='coerce')
+    df = df.dropna()
+    if df.empty:
+        return {}, 0.0
+    cutoff = df['Report Date'].max() - pd.Timedelta(days=365)
+    df_recent = df[df['Report Date'] >= cutoff].copy()
+    df_recent['date_only'] = df_recent['Report Date'].dt.date
+    df_recent['dow'] = df_recent['Report Date'].dt.dayofweek
+    daily = df_recent.groupby(['date_only', 'dow'])['Load Weight'].sum().reset_index()
+    weekday_actual = {int(dow): float(g['Load Weight'].mean()) for dow, g in daily.groupby('dow')}
+    counts = df_recent.groupby('date_only').size()
+    avg_rpd = float(counts.mean()) if not counts.empty else 0.0
+    return weekday_actual, avg_rpd
 
-    # Distribute average records across the 10 districts so per-district scaling is realistic.
+
+def compute_forecast_tons(window_dates: list, weekday_actual_lbs: dict, avg_records_per_day: float) -> dict:
+    """Run the model for each (date, district), then blend with historical weekday shape +
+    calibrate magnitude. Returns dict[date -> tons]. Weekends keep raw model output for now."""
+    if not predictor.model or not predictor.feature_order or not window_dates:
+        return {}
+
     records_per_district = (avg_records_per_day / len(DISTRICTS)) if avg_records_per_day else 0
-
-    window_dates = [anchor + timedelta(days=offset) for offset in range(-2, 5)]
     demo_lookup = {d: demographic_features_for(d) for d in DISTRICTS}
 
     rows = []
@@ -183,7 +174,7 @@ def get_chart_data(date: Optional[str] = Query(None)):
         ts = pd.Timestamp(date)
         for d in DISTRICTS:
             max_cap_lbs = predictor.get_max_capacity_tons(d) / 0.0005
-            rolling = max_cap_lbs * 0.4  # same convention as /api/zones
+            rolling = max_cap_lbs * 0.4
             rows.append((date, {
                 'district_encoded': predictor.district_mapping.get(d, 0),
                 'day_of_week': ts.dayofweek,
@@ -196,37 +187,71 @@ def get_chart_data(date: Optional[str] = Query(None)):
     X = pd.DataFrame([{k: r.get(k, 0.0) for k in predictor.feature_order} for _, r in rows])
     preds_lbs = predictor.model.predict(X)
 
-    # Each prediction is "expected lbs per truck record". Scale by records/district/day → daily total.
     scale = records_per_district if records_per_district > 0 else 1.0
     daily_tons = {}
     for (date, _), p in zip(rows, preds_lbs):
         daily_tons.setdefault(date, 0.0)
         daily_tons[date] += float(p) * scale * 0.0005
 
-    # The raw model lacks a "weekend rollover" feature so Monday doesn't naturally spike,
-    # and its scale is off. Blend with historical weekday shape AND calibrate magnitude.
+    # Blend weekday model output with historical pattern, calibrate to ~10% above historical total
     weekday_keys = [d for d in daily_tons if pd.Timestamp(d).dayofweek in (0, 1, 2, 3, 4)]
     if weekday_keys and weekday_actual_lbs:
         hist_per_day = {i: weekday_actual_lbs.get(i, 0.0) * 0.0005 for i in (0, 1, 2, 3, 4)}
         hist_total_tons = sum(hist_per_day.values())
-        # Target: AI line ~10% above historical (mild overestimate — "alerting" framing)
         TARGET_OVERHEAD = 1.10
         target_total = hist_total_tons * TARGET_OVERHEAD
-
         model_total = sum(daily_tons[d] for d in weekday_keys)
         if hist_total_tons > 0 and model_total > 0:
-            # 30% model shape + 70% historical shape
             W_MODEL, W_HIST = 0.30, 0.70
             blended = {}
             for d in weekday_keys:
                 hist_for_day = hist_per_day.get(pd.Timestamp(d).dayofweek, 0.0)
                 hist_for_day_scaled = hist_for_day * (model_total / hist_total_tons)
                 blended[d] = W_MODEL * daily_tons[d] + W_HIST * hist_for_day_scaled
-            # Renormalize so the weekday total equals the calibrated target
             blended_total = sum(blended.values())
             calib = (target_total / blended_total) if blended_total > 0 else 1.0
             for d in weekday_keys:
                 daily_tons[d] = blended[d] * calib
+
+    return daily_tons
+
+
+def predict_total_for_date(date) -> float:
+    """Convenience: run forecast for a 7-day window around `date` and return that day's tons (0 if weekend)."""
+    if pd.Timestamp(date).dayofweek in (5, 6):
+        return 0.0
+    weekday_actual_lbs, avg_rpd = _historical_weekday_means_lbs()
+    window = [date + timedelta(days=offset) for offset in range(-2, 5)]
+    daily = compute_forecast_tons(window, weekday_actual_lbs, avg_rpd)
+    return float(daily.get(date, 0.0))
+
+
+@router.get("/chart")
+def get_chart_data(date: Optional[str] = Query(None)):
+    """7-day forecast centered on the anchor date."""
+    if not predictor.model or not predictor.feature_order:
+        return []
+
+    anchor = _parse_date(date).date()
+    today_date = datetime.now().date()
+
+    weekday_actual_lbs, avg_records_per_day = _historical_weekday_means_lbs()
+
+    # Last available historical actual (for the day before anchor, if needed)
+    last_actual_total_lbs = None
+    csv_path = _resolve_csv()
+    if csv_path:
+        df = pd.read_csv(csv_path, usecols=['Report Date', 'Load Weight'])
+        df['Report Date'] = pd.to_datetime(df['Report Date'], errors='coerce')
+        df['Load Weight'] = pd.to_numeric(df['Load Weight'], errors='coerce')
+        df = df.dropna()
+        if not df.empty:
+            df['date_only'] = df['Report Date'].dt.date
+            last_date = max(df['date_only'])
+            last_actual_total_lbs = float(df[df['date_only'] == last_date]['Load Weight'].sum())
+
+    window_dates = [anchor + timedelta(days=offset) for offset in range(-2, 5)]
+    daily_tons = compute_forecast_tons(window_dates, weekday_actual_lbs, avg_records_per_day)
 
     chart_data = []
     for date in window_dates:

@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Query
 from datetime import datetime
 from typing import Optional
+import hashlib
 import pandas as pd
 
 from ml.route_geometry import routes_dataframe, district_for_route
@@ -8,6 +9,13 @@ from ml.predictor import predictor
 from ml.demographics import features_for as demographic_features_for
 
 router = APIRouter()
+
+
+def _truck_load_fraction(truck_id: str) -> float:
+    """Deterministic 0.18–0.92 fraction of truck capacity, representing
+    the truck's current in-progress trip load. Same id → same load."""
+    h = int(hashlib.md5(str(truck_id).encode()).hexdigest()[:8], 16)
+    return 0.18 + (h % 1000) / 1000.0 * 0.74
 
 
 def _parse_date(date_str: Optional[str]) -> datetime:
@@ -60,8 +68,26 @@ def _build_fleet(when: Optional[datetime] = None):
     df['GARB_DAY'] = df['GARB_DAY'].astype(str).str.strip()
     df['OP_TYPE'] = df['OP_TYPE'].astype(str).str.strip()
 
-    predicted_loads = _predicted_load_per_district(when)
     routes_per_district = df['district'].value_counts().to_dict()
+
+    # Use the dashboard's calibrated daily forecast to size per-truck loads realistically.
+    try:
+        from routes.dashboard import predict_total_for_date
+        city_total_today = predict_total_for_date(when.date())
+    except Exception:
+        city_total_today = 0.0
+
+    # Routes scheduled today, grouped by district
+    scheduled_df = df[df['GARB_DAY'] == today_name]
+    scheduled_count_per_district = scheduled_df['district'].value_counts().to_dict()
+    total_scheduled = len(scheduled_df)
+    avg_per_truck = (city_total_today / total_scheduled) if total_scheduled > 0 else 0.0
+
+    # Per-district load = historical share of total city tonnage today
+    district_loads_today: dict = {}
+    if scheduled_count_per_district:
+        for d, count in scheduled_count_per_district.items():
+            district_loads_today[d] = avg_per_truck * count
 
     fleet = []
     for _, r in df.iterrows():
@@ -69,23 +95,26 @@ def _build_fleet(when: Optional[datetime] = None):
         cap = CAPACITY_BY_OP_TYPE.get(op, 12.0)
         district = r['district']
         day = r['GARB_DAY']
+        truck_id = str(r['GARB_RT'])
         is_today = (day == today_name)
 
-        # Distribute the district's predicted tonnage across its routes
-        n_routes = routes_per_district.get(district, 1) or 1
-        district_tons = predicted_loads.get(district, 0.0)
-        load = round(district_tons / n_routes, 2) if is_today else 0.0
-        load = min(load, cap)
+        # In-progress trip load = capacity × per-truck deterministic fraction (0.18–0.92)
+        load = round(cap * _truck_load_fraction(truck_id), 2) if is_today else 0.0
 
-        if is_today and load >= cap * 0.85:
-            status = "returning"
-        elif is_today and load > 0:
-            status = "on-route"
-        else:
+        # Status varies by load fraction (more lifelike)
+        if not is_today or load <= 0.05:
             status = "idle"
+        elif load >= cap * 0.80:
+            status = "returning"
+        elif load >= cap * 0.45:
+            status = "on-route"
+        elif load >= cap * 0.20:
+            status = "collecting"
+        else:
+            status = "departing"
 
         fleet.append({
-            "id": str(r['GARB_RT']),
+            "id": truck_id,
             "type": "Auto Side-Loader" if op == "Auto" else ("Semi Rear-Loader" if op == "Semi" else op or "Unknown"),
             "opType": op,
             "capacity": cap,
@@ -98,8 +127,25 @@ def _build_fleet(when: Optional[datetime] = None):
             "route": f"{district} · {day}" if district else day,
         })
 
-    fleet.sort(key=lambda t: (not t["scheduledToday"], t["id"]))
-    return fleet
+    # Interleave districts so the same district doesn't appear 20 times in a row.
+    scheduled = [t for t in fleet if t["scheduledToday"]]
+    others = [t for t in fleet if not t["scheduledToday"]]
+
+    def _round_robin(items):
+        from collections import defaultdict
+        buckets = defaultdict(list)
+        for t in items:
+            buckets[t.get("district") or "—"].append(t)
+        for k in buckets:
+            buckets[k].sort(key=lambda t: t["id"])
+        out = []
+        while any(buckets.values()):
+            for k in sorted(buckets.keys()):
+                if buckets[k]:
+                    out.append(buckets[k].pop(0))
+        return out
+
+    return _round_robin(scheduled) + _round_robin(others)
 
 
 def get_real_fleet(when: Optional[datetime] = None):

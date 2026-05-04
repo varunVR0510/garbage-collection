@@ -263,6 +263,168 @@ def compute_route_summary(date_str: Optional[str] = None):
     }
 
 
+@router.get("/truck/{truck_id}")
+def get_truck_route(truck_id: str, date: Optional[str] = Query(None)):
+    """Per-truck multi-stop tour:
+       Depot → Stop 1 → Stop 2 → Stop 3 → Landfill
+    Stops are picked from:
+      - Already-dispatched zone (mandatory if exists)
+      - Truck's home district
+      - Up to 2 nearest high/medium priority zones (capacity-aware)
+    Stops are visited in nearest-neighbor order from depot.
+    """
+    from routes.fleet import _build_fleet
+    from datetime import datetime as _dt
+    when = _dt.fromisoformat(date) if date else _dt.now()
+
+    fleet = _build_fleet(when)
+    truck = next((t for t in fleet if t['id'] == truck_id), None)
+    if not truck:
+        return {"timeline": [], "summary": None, "error": "Truck not found"}
+
+    import hashlib
+    home_district = truck.get('district') or 'District 1'
+    capacity = float(truck.get('capacity') or 12.0)
+    coords = _coords()
+    zones = {z['name']: z for z in get_zones_predictions(date=date)}
+    home_centroid = coords.get(home_district, DEPOT_COORD)
+
+    def _make_stop(zone_name: str, demand_t: float, reason_override: Optional[str] = None) -> dict:
+        z = zones.get(zone_name, {})
+        return {
+            "name": zone_name,
+            "level": z.get('level', 0),
+            "status": z.get('status', 'low'),
+            "reason": reason_override or z.get('reason', 'Routine pickup'),
+            "demand": demand_t,
+        }
+
+    # Per-truck deterministic seed so each truck picks DIFFERENT neighbors
+    truck_seed = int(hashlib.md5(truck_id.encode()).hexdigest()[:8], 16)
+
+    candidates: list[dict] = []
+
+    # 1. Already-dispatched zone (mandatory)
+    for d in db.list_dispatches_today():
+        if d['truck_id'] == truck_id:
+            candidates.append(_make_stop(d['zone_name'], min(capacity * 0.55, 7.0), "Manually dispatched"))
+            break
+
+    # 2. Home district (always include)
+    if not any(c['name'] == home_district for c in candidates):
+        candidates.append(_make_stop(home_district, min(capacity * 0.50, 6.5)))
+
+    # 3. Up to 2 high/medium priority zones (nearest first, capacity-permitting)
+    priority_zones = [
+        z for z in zones.values()
+        if z['status'] in ('high', 'medium') and not any(c['name'] == z['name'] for c in candidates)
+    ]
+    priority_zones.sort(key=lambda z: haversine(home_centroid, coords.get(z['name'], DEPOT_COORD)))
+    used_capacity = sum(c['demand'] for c in candidates)
+    for z in priority_zones[:2]:
+        extra = min(capacity * 0.25, 3.5)
+        if used_capacity + extra > capacity * 0.95:
+            break
+        candidates.append(_make_stop(z['name'], extra))
+        used_capacity += extra
+
+    # 4. Fill the tour with neighbor districts the truck hasn't been routed through yet.
+    #    Use a per-truck PRNG so different trucks of the same home pick DIFFERENT neighbors.
+    import random as _random
+    if len(candidates) < 3:
+        existing_names = {c['name'] for c in candidates}
+        neighbors = [
+            (haversine(home_centroid, coords.get(n, DEPOT_COORD)), n)
+            for n in [f"District {i}" for i in range(1, 11)]
+            if n not in existing_names
+        ]
+        neighbors.sort()
+        # Pool: 6 nearest. Shuffle it deterministically per truck and take 2.
+        nearest_pool = [n for _, n in neighbors[:6]]
+        rng = _random.Random(truck_seed)
+        rng.shuffle(nearest_pool)
+
+        pick_count = min(2, 3 - len(candidates))
+        for chosen in nearest_pool[:pick_count]:
+            extra = min(capacity * 0.22, 3.0)
+            if used_capacity + extra > capacity * 0.95:
+                break
+            candidates.append(_make_stop(chosen, extra, "Adjacent district sweep"))
+            used_capacity += extra
+
+    # Order stops via nearest-neighbor starting at depot
+    ordered: list[dict] = []
+    remaining = list(candidates)
+    cursor = DEPOT_COORD
+    while remaining:
+        remaining.sort(key=lambda c: haversine(cursor, coords.get(c['name'], DEPOT_COORD)))
+        nxt = remaining.pop(0)
+        ordered.append(nxt)
+        cursor = coords.get(nxt['name'], DEPOT_COORD)
+
+    # Build timeline
+    timeline = [{
+        "step": 1, "location": "Austin Central Depot (Start)",
+        "type": "start", "note": f"Departure · truck {truck_id} · capacity {capacity:.0f} T",
+        "priority": None,
+    }]
+    cursor = DEPOT_COORD
+    total_km = 0.0
+    cumulative_load = 0.0
+    leg_kms: list[float] = []
+    for i, c in enumerate(ordered):
+        nxt = coords.get(c['name'], DEPOT_COORD)
+        leg = haversine(cursor, nxt)
+        total_km += leg
+        leg_kms.append(round(leg, 1))
+        cumulative_load += c['demand']
+        level_part = f"Predicted Fill: {c['level']}% · " if c['level'] is not None else ""
+        note = f"{level_part}Pickup ~{c['demand']:.1f} T → load {cumulative_load:.1f}/{capacity:.0f} T · {leg:.1f} km from prev"
+        timeline.append({
+            "step": i + 2,
+            "location": c['name'],
+            "type": c['status'],
+            "note": note,
+            "priority": (i + 1) if c['status'] in ('high', 'medium', 'dispatched') else None,
+        })
+        cursor = nxt
+
+    return_km = haversine(cursor, DEPOT_COORD)
+    total_km += return_km
+    timeline.append({
+        "step": len(timeline) + 1,
+        "location": "TDS Landfill (End)",
+        "type": "end",
+        "note": f"Return · {return_km:.1f} km · final load {cumulative_load:.1f}/{capacity:.0f} T",
+        "priority": None,
+    })
+
+    fuel_l = total_km * FUEL_LITRES_PER_KM
+    stops = len(ordered)
+    hours = total_km / 25.0 + stops * 0.5  # 25 km/h + 30 min/stop
+    h = int(hours)
+    m = int((hours - h) * 60)
+
+    return {
+        "timeline": timeline,
+        "summary": {
+            "distance": f"{total_km:.1f} km",
+            "fuel": f"{fuel_l:.1f} L",
+            "time": f"{h}h {m}m",
+            "stops": stops,
+            "legKms": leg_kms,
+            "returnKm": round(return_km, 1),
+            "targetDistricts": [c['name'] for c in ordered],
+            "truckHomeDistrict": home_district,
+            "scheduledToday": bool(truck.get('scheduledToday')),
+            "currentLoad": truck.get('load'),
+            "capacity": capacity,
+            "tourLoad": round(cumulative_load, 1),
+            "loadFraction": round(cumulative_load / capacity, 2) if capacity else 0,
+        },
+    }
+
+
 @router.get("/summary")
 def get_route_summary(date: Optional[str] = Query(None)):
     s = compute_route_summary(date)

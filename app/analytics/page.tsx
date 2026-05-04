@@ -7,6 +7,7 @@ import {
 } from 'recharts';
 import { BrainCircuit, RefreshCw, TrendingUp, CheckCircle } from 'lucide-react';
 import { toast } from 'react-hot-toast';
+import { useSelectedDate } from '@/lib/useSelectedDate';
 
 export default function AnalyticsPage() {
   const [retraining, setRetraining] = useState(false);
@@ -15,25 +16,27 @@ export default function AnalyticsPage() {
   const [analyticsMetrics, setAnalyticsMetrics] = useState<any[]>([]);
   const [fuelChartData, setFuelChartData] = useState<any[]>([]);
   const [collectionsData, setCollectionsData] = useState<any[]>([]);
+  const [selectedDate] = useSelectedDate();
 
   const loadAll = () => {
-    fetch('http://localhost:8000/api/metrics')
+    const q = `?date=${selectedDate}`;
+    fetch(`http://localhost:8000/api/metrics${q}`)
       .then(res => res.json())
       .then(data => setAnalyticsMetrics(data))
       .catch(err => console.error("Error fetching metrics:", err));
 
-    fetch('http://localhost:8000/api/fuel')
+    fetch(`http://localhost:8000/api/fuel${q}`)
       .then(res => res.json())
       .then(data => setFuelChartData(data))
       .catch(err => console.error("Error fetching fuel data:", err));
 
-    fetch('http://localhost:8000/api/collections')
+    fetch(`http://localhost:8000/api/collections${q}`)
       .then(res => res.json())
       .then(data => setCollectionsData(data))
       .catch(err => console.error("Error fetching collections data:", err));
   };
 
-  useEffect(() => { loadAll(); }, []);
+  useEffect(() => { loadAll(); }, [selectedDate]);
 
   const handleRetrain = async () => {
     setRetraining(true);
